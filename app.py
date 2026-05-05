@@ -419,15 +419,19 @@ def run_ai_loop(user_message: str, chat_history: list):
     )]
 
     while True:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=contents,
-            config=gtypes.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                tools=[GEMINI_TOOL],
-                temperature=0.1,
-            ),
-        )
+        try:
+            response = client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=contents,
+                config=gtypes.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    tools=[GEMINI_TOOL],
+                    temperature=0.1,
+                ),
+            )
+        except Exception as e:
+            yield ("error", f"Gemini API error: {type(e).__name__}: {e}")
+            return
 
         candidate = response.candidates[0]
         contents.append(candidate.content)  # add assistant turn to history
