@@ -5,7 +5,8 @@ import plotly.express as px
 from pathlib import Path
 import time
 import os
-import anthropic
+import google.genai as genai
+from google.genai import types as gtypes
 import boto3
 
 st.set_page_config(page_title="Quant Research Platform", layout="wide", page_icon="📈")
@@ -17,14 +18,14 @@ AWS_REGION      = "ap-south-1"
 
 # ─── AWS / Anthropic clients ──────────────────────────────────────────────────
 
-def get_anthropic_key():
+def get_gemini_key():
     try:
-        k = st.secrets.get("ANTHROPIC_API_KEY", "")
+        k = st.secrets.get("GEMINI_API_KEY", "")
         if k:
             return k
     except Exception:
         pass
-    return os.environ.get("ANTHROPIC_API_KEY", "")
+    return os.environ.get("GEMINI_API_KEY", "")
 
 def get_aws_session():
     try:
@@ -352,18 +353,20 @@ Key cols: ts, symbol, option_symbol, option_type, level (1=best), bid_price, ask
 - If a query fails, diagnose the error and retry with a fix
 """
 
-TOOLS = [{
-    "name": "run_query",
-    "description": "Execute a Presto SQL query against the dhan_tick_data Athena database and return the results.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "sql":         {"type": "string", "description": "The SQL query to run"},
-            "description": {"type": "string", "description": "One-line description of what this query does"},
-        },
-        "required": ["sql", "description"],
-    },
-}]
+GEMINI_TOOL = gtypes.Tool(functionDeclarations=[
+    gtypes.FunctionDeclaration(
+        name="run_query",
+        description="Execute a Presto SQL query against the dhan_tick_data Athena database and return the results.",
+        parameters=gtypes.Schema(
+            type="OBJECT",
+            properties={
+                "sql":         gtypes.Schema(type="STRING", description="The Presto SQL query to run"),
+                "description": gtypes.Schema(type="STRING", description="One-line description of what this query does"),
+            },
+            required=["sql", "description"],
+        ),
+    )
+])
 
 def auto_chart(df: pd.DataFrame):
     if df is None or df.empty or len(df.columns) < 2:
@@ -399,60 +402,71 @@ def auto_chart(df: pd.DataFrame):
 
     return None
 
-def run_ai_loop(user_message: str, api_messages: list):
-    """Run full agentic loop. Yields (type, payload) events for streaming display."""
-    key = get_anthropic_key()
+def run_ai_loop(user_message: str, chat_history: list):
+    """Run full Gemini agentic loop. Yields (type, payload) events for streaming display."""
+    key = get_gemini_key()
     if not key:
-        yield ("error", "ANTHROPIC_API_KEY not set. Configure it in Streamlit secrets or as an env var.")
+        yield ("error", "GEMINI_API_KEY not set. Add it to Streamlit secrets.")
         return
 
-    client   = anthropic.Anthropic(api_key=key)
-    messages = list(api_messages) + [{"role": "user", "content": user_message}]
-    last_df  = None
+    client = genai.Client(api_key=key)
+    last_df = None
+
+    # Reconstruct chat from history and send current message
+    contents = list(chat_history) + [gtypes.Content(
+        role="user",
+        parts=[gtypes.Part(text=user_message)],
+    )]
 
     while True:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=contents,
+            config=gtypes.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                tools=[GEMINI_TOOL],
+                temperature=0.1,
+            ),
         )
 
-        if response.stop_reason == "tool_use":
-            messages.append({"role": "assistant", "content": response.content})
-            tool_results = []
+        candidate = response.candidates[0]
+        contents.append(candidate.content)  # add assistant turn to history
 
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
+        # Check for function calls
+        fn_parts = [p for p in candidate.content.parts if p.function_call is not None]
 
-                sql  = block.input["sql"]
-                desc = block.input.get("description", "Running query…")
+        if fn_parts:
+            tool_response_parts = []
+            for part in fn_parts:
+                fc   = part.function_call
+                sql  = fc.args.get("sql", "")
+                desc = fc.args.get("description", "Running query…")
                 yield ("sql", (desc, sql))
 
                 try:
-                    df     = run_athena_query(sql)
+                    df      = run_athena_query(sql)
                     last_df = df
                     yield ("result", df)
-                    csv    = df.head(300).to_csv(index=False)
-                    content = f"Query returned {len(df)} rows:\n{csv}"
+                    result_text = f"Query returned {len(df)} rows:\n{df.head(300).to_csv(index=False)}"
                 except Exception as e:
                     yield ("error", str(e))
-                    content = f"Error: {e}"
+                    result_text = f"Error executing query: {e}"
 
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": content,
-                })
+                tool_response_parts.append(gtypes.Part(
+                    function_response=gtypes.FunctionResponse(
+                        name=fc.name,
+                        response={"result": result_text},
+                    )
+                ))
 
-            messages.append({"role": "user", "content": tool_results})
+            # Send tool results back
+            contents.append(gtypes.Content(role="user", parts=tool_response_parts))
 
         else:
-            text = "".join(b.text for b in response.content if hasattr(b, "text"))
+            # Final text response
+            text = "".join(p.text for p in candidate.content.parts if hasattr(p, "text") and p.text)
             fig  = auto_chart(last_df)
-            yield ("final", (text, last_df, fig, messages))
+            yield ("final", (text, last_df, fig, contents))
             return
 
 def show_ai_query():
@@ -525,7 +539,7 @@ def show_ai_query():
         if final_text:
             st.session_state.chat.append(("assistant", final_text, final_df, final_fig))
         if updated_msgs:
-            st.session_state.api_msgs = updated_msgs
+            st.session_state.api_msgs = updated_msgs  # full Gemini contents history
 
 # ─── Navigation ───────────────────────────────────────────────────────────────
 
